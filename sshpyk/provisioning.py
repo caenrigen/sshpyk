@@ -4,8 +4,10 @@ import asyncio
 import hashlib
 import json
 import re
+import os
 import subprocess
 import uuid
+import time
 from enum import Enum, unique
 from itertools import dropwhile
 from pathlib import Path
@@ -29,7 +31,7 @@ from .utils import (
     verify_local_ssh,
 )
 
-REMOTE_INFO_LINE = "SSHPYK_SHELL=$SHELL SSHPYK_HOST=$HOST SSHPYK_USER=$USER"
+REMOTE_INFO_LINE = "SSHPYK_SHELL=$SHELL SSHPYK_HOST=`hostname` SSHPYK_USER=$USER"
 EXEC_PREFIX = "SSHPYK_KERNELAPP_EXEC"
 RGX_EXEC_PREFIX = re.compile(rf"{EXEC_PREFIX}=(\d+)")
 PS_PREFIX = "SSHPYK_PS_OUTPUT_START"
@@ -46,6 +48,8 @@ REM_SESSION_KEY_NAME = "SSHPYK_SESSION_KEY"
 # extracted from jupyter_client/kernelspec.py
 RGX_KERNEL_NAME = re.compile(r"^[a-z0-9._-]+$", re.IGNORECASE)
 RGX_SSH_HOST_ALIAS = re.compile(r"^[a-z0-9_-]+$", re.IGNORECASE)
+PID_PREFIX_SENTINEL = "SSHPYK_SENTINEL_PID"
+RGX_PID_SENTINEL = re.compile(rf"{PID_PREFIX_SENTINEL}=(\d+)")
 
 KERNELAPP_PY = (Path(__file__).parent / "kernelapp.py").read_bytes()
 KA_VERSION = hashlib.sha256(KERNELAPP_PY).hexdigest()[:8]  # 4 bytes = 8 hex chars
@@ -209,6 +213,7 @@ class SSHKernelProvisioner(KernelProvisionerBase):
 
     rem_pid_ka = None  # to be able to kill the remote SSHKernelApp process
     rem_pid_k = None  # to be able to monitor and kill the remote kernel process
+    rem_pid_sentinel = None # to be able to stop the tunnel sentinel
 
     rem_proc_cmds = None
 
@@ -398,6 +403,13 @@ class SSHKernelProvisioner(KernelProvisionerBase):
             self.le(msg)
             raise RuntimeError(msg) from e
 
+    def extract_rem_pid_sentinel_handler(self, line: str):
+        match = RGX_PID_SENTINEL.search(line)
+        if match:
+            self.rem_pid_sentinel = int(match.group(1))
+            return True
+        return False
+
     async def fetch_remote_connection_info(self):
         try:
             # For details on the way the processes are spawned see the Popen call in
@@ -536,6 +548,54 @@ class SSHKernelProvisioner(KernelProvisionerBase):
         # between the different async methods that jupyter_client calls.
         # This was introduced mainly because JupyterLab would often try to restart the
         # kernel while it was already shutting down or restarting.
+
+        def start_sentinel( ):
+            # Hold the tunnel open
+            cmd2 = [self.ssh, self.ssh_host_alias, 'bash', '-s']
+            cmd2_lines = [
+                f"echo {self.remote_script_dir}/.pid_sentinel_{self.ssh_host_alias}",
+                f"echo {PID_PREFIX_SENTINEL}=$$",
+                f"if test -f {self.remote_script_dir}/.pid_sentinel_{self.ssh_host_alias}; then",
+                f"    EXISTING=`cat {self.remote_script_dir}/.pid_sentinel_{self.ssh_host_alias}`",
+                f"    if kill -0 $EXISTING > /dev/null 2>&1; then kill -SIGUSR2 $EXISTING; fi",
+                f"fi",
+                f"echo $$ > {self.remote_script_dir}/.pid_sentinel_{self.ssh_host_alias}",
+                'handle_sigusr2( ) {',
+                f"   rm -f {self.remote_script_dir}/.pid_sentinel_{self.ssh_host_alias}",
+                '    exit 0',
+                '}',
+                "trap 'handle_sigusr2' SIGUSR2",
+                'while true; do',
+                '  sleep 1',
+                'done',
+            ]
+            sentinel_script = "\n".join(cmd2_lines)
+            self.ld(f"Attempting to hold the ControlMaster socket open with with {cmd2 = }")
+            self.ld(f"ControlMaster sentinel script, {sentinel_script = }")
+            process2 = subprocess.Popen(  # noqa: S603
+                cmd2,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.PIPE,
+                start_new_session=self.independent_local_processes,
+                bufsize=1,
+                universal_newlines=True,
+            )
+            process2.stdin.write(sentinel_script)
+            process2.stdin.flush()
+            process2.stdin.close()
+
+            self.popen_procs[process2.pid] = process2
+
+            while True:
+                line = process2.stdout.readline( ).rstrip( )
+                self.ld( f"Sentinel output line: {line}" )
+                if self.extract_rem_pid_sentinel_handler(line):
+                    break
+
+            self.ld( f"Sentinel launched PID={self.rem_pid_sentinel}" )
+
+
         self._fetch_remote_processes_lock = asyncio.Lock()
         self._poll_lock = asyncio.Lock()
         self._cleanup_lock = asyncio.Lock()
@@ -580,7 +640,46 @@ class SSHKernelProvisioner(KernelProvisionerBase):
         self.ld(f"{self.existing = }, {self.persistent = }, {self.persistent_file = }")
 
         # Auto-detect SSH executable if not specified, verify by calling it
-        self.ssh = verify_local_ssh(self.ssh, self.log, "ssh", self.log_prefix)
+        self.ssh, self.controlmaster = verify_local_ssh(self.ssh_host_alias, self.ssh, self.log, "ssh", self.log_prefix)
+
+        # Initialize control master connection
+        if self.controlmaster is None:
+            raise RuntimeError("SSH ControlMaster path not found")
+
+        if os.path.exists(self.controlmaster):
+            self.ld( f"SSH ControlMaster socket exists: {self.controlmaster}" )
+        else:
+            self.ld( f"SSH ControlMaster socket does not exist: {self.controlmaster}" )
+
+        if not os.path.exists(self.controlmaster):
+            cmd = [self.ssh, '-M', '-S',  self.controlmaster, '-o', 'ControlPersist=20m', '-fN', self.ssh_host_alias]
+            self.ld(f"Initializing ControlMaster socket with {cmd = }")
+            process = subprocess.Popen(  # noqa: S603
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.PIPE,
+                start_new_session=self.independent_local_processes,
+                bufsize=1,
+                universal_newlines=True,
+            )
+            self.popen_procs[process.pid] = process
+
+        if os.path.exists(self.controlmaster):
+            self.ld( f"SSH ControlMaster socket now exists: {self.controlmaster}" )
+            start_sentinel( )
+        else:
+            socket_exists = False
+            for i in range(16000):
+                time.sleep(0.0001)
+                if os.path.exists(self.controlmaster):
+                    socket_exists = True
+                    break
+            if socket_exists:
+                self.ld( f"SSH ControlMaster socket finally exists ({i}): {self.controlmaster}" )
+                start_sentinel( )
+            else:
+                self.ld( f"SSH ControlMaster socket still does not exist ({i}): {self.controlmaster}" )
 
         if self.parent is None:
             raise RuntimeError("Parent KernelManager not set")
@@ -588,27 +687,38 @@ class SSHKernelProvisioner(KernelProvisionerBase):
         # ! REMINDER: this method is NOT called on kernel restarts.
 
     def make_remote_script_fp(self):
-        """Make the remote script file path."""
-        return f"{self.remote_script_dir}/sshpyk-kernel-v{KA_VERSION}"
+        """Make the remote script file path. This path includes the SSH host name
+           because the created script may include a PID. It COULD be based on the
+           PID to be completely safe, but this would cause an accumulation of these
+           scripts on the remote host"""
+        return f"{self.remote_script_dir}/sshpyk-{self.ssh_host_alias}-kernel-v{KA_VERSION}"
 
     async def write_remote_script(self):
         """Write the remote script on the remote machine."""
         remote_script_fp = self.make_remote_script_fp()
+        self.ld( f"Write remote script: {remote_script_fp}" )
         self.li(
             f"Will use {self.remote_python!r} on {self.ssh_host_alias!r} to run "
             f"{remote_script_fp!r}"
         )
-        script = f"#!{self.remote_python}\n{KERNELAPP_PY}"
-        cmd = [
+        if self.rem_pid_sentinel:
+            stop_sentinel = f"os.kill({self.rem_pid_sentinel}, SIGUSR2)"
+            self.ld( f"Injecting '{stop_sentinel}' into remote KernelApp" )
+            script = f"#!{self.remote_python}\n{KERNELAPP_PY.replace('###STOP#SENTINEL###',stop_sentinel)}"
+        else:
+            script = f"#!{self.remote_python}\n{KERNELAPP_PY}"
+        cmds = [
             # For debugging purposes
             f'echo "{REMOTE_INFO_LINE}"',
             f'mkdir -p "{self.remote_script_dir}"',
-            f'cat > "{remote_script_fp}" < /dev/stdin',
+            f"""cat > "{remote_script_fp}" << 'EOF-APP-SCRIPT'""",
+            f'{script}',
+            f'EOF-APP-SCRIPT',
             f'chmod 755 "{remote_script_fp}"',
             f"echo {EXEC_PREFIX}=$?",
         ]
-        self.ld(f"Remote command {cmd = }")
-        cmd = [self.ssh, self.ssh_host_alias, "; ".join(cmd)]
+        self.ld(f"Remote commands {cmds = }")
+        cmd = [self.ssh, self.ssh_host_alias, 'bash', '-s']
         self.ld(f"Local command {cmd = }")
         process = subprocess.Popen(  # noqa: S603
             cmd,
@@ -620,7 +730,7 @@ class SSHKernelProvisioner(KernelProvisionerBase):
             universal_newlines=True,
         )
         self.popen_procs[process.pid] = process
-        process.stdin.write(script)
+        process.stdin.write("\n".join(cmds))
         process.stdin.flush()
         process.stdin.close()
         await self.extract_from_script_write(process=process, cmd=cmd)
@@ -713,6 +823,7 @@ class SSHKernelProvisioner(KernelProvisionerBase):
         if not self.restart_requested:
             await self.write_remote_script()
         remote_script_fp = self.make_remote_script_fp()
+        self.ld( f"Remote script path: {remote_script_fp}" )
         sig_scheme = self.parent.session.signature_scheme  # type: ignore
         rem_args = [
             f'"{remote_script_fp}"',
@@ -775,15 +886,17 @@ class SSHKernelProvisioner(KernelProvisionerBase):
             # Print the PID of the remote SSHKernelApp process
             f'echo "{PID_PREFIX_KERNEL_APP}=$$"',
             # Launch the SSHKernelApp
-            f"exec nohup {cmd}",
+            f"exec nohup {cmd} << 'EOF-key'",
+            km.session.key.decode(),
+            'EOF-key',
         ]
-        cmd = "; ".join(cmd_parts)
+        cmd_input = "\n".join(cmd_parts)
         self.ld(f"Remote command {cmd = }")
+        self.ld(f"Remote script {cmd_input =}")
         cmd = [
             self.ssh,
-            # "-t",  # ! We don't need a pseudo-tty to be allocated
             self.ssh_host_alias,
-            cmd,
+            'bash', '-s'
         ]
         self.ld(f"Local command {cmd = }")
 
@@ -809,11 +922,7 @@ class SSHKernelProvisioner(KernelProvisionerBase):
             universal_newlines=True,
         )
         self.popen_procs[process.pid] = process
-        # Preserving the key is essential for kernel restarts and for
-        # externally-provided connection files.
-        # Communicate the session key to the remote process securely using the stdin
-        # pipe of the ssh process.
-        process.stdin.write(km.session.key.decode() + "\n")
+        process.stdin.write(cmd_input)
         process.stdin.flush()
         # Close the input pipe, see launch_kernel in jupyter_client
         # When we close the input pipe, the remote process will receive EOF and the
