@@ -32,9 +32,11 @@ SSHPYK_PERSISTENT_FP_BASE = "sshpyk-kernel"
 
 
 def verify_local_ssh(
-    ssh: Optional[str], log: logging.Logger = logger, name: str = "ssh", lp: str = ""
+    alias: str, ssh: Optional[str], log: logging.Logger = logger, name: str = "ssh", lp: str = ""
 ) -> str:
     """Verify that the local SSH is working."""
+    if not alias:
+        raise EnvironmentError(f"{lp}Local'{name!r}' SSH host alias not found")
     if not ssh:
         ssh = which(name)
         if not ssh:
@@ -43,7 +45,7 @@ def verify_local_ssh(
             log.info(f"{lp}Auto-detected {name!r} executable: {ssh}")
     if not ssh:
         raise EnvironmentError(f"{lp}Local '{name!r}' executable not found.")
-    cmd = [ssh, "-V"]
+    cmd = [ssh, "-G", alias]
     log.debug(f"{lp}Verifying local {name!r} {cmd = }")
     ret = run(  # noqa: S603
         cmd,
@@ -51,13 +53,22 @@ def verify_local_ssh(
         text=True,
         check=False,
     )  # type: ignore
-    ok = ret.returncode == 0
+
+    ok = False
+    control_path = None
+    if ret.returncode == 0:
+        for l in ret.stdout.splitlines():
+            if l.startswith('controlpath '):
+                control_path=l[12:]
+                ok = True
+                break
+
     if not ok:
-        msg = f"{lp}Local {name!r} verification failed"
+        msg = f"{lp}Local {name!r} verification failed" if control_path else f"{lp}Local {name!r} verification failed (SSH ControlMaster required)"
         log.error(msg)
         raise EnvironmentError(msg)
     log.debug(f"{lp}Local {name!r} verification succeeded")
-    return ssh
+    return ssh, control_path
 
 
 def verify_ssh_connection(

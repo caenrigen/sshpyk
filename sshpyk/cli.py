@@ -233,7 +233,7 @@ def perform_kernel_checks(kernel, skip_checks, remote_specs_cache):
         return results
 
     try:
-        ssh_bin = verify_local_ssh(kernel.get("ssh", None), name="ssh")
+        ssh_bin,_ = verify_local_ssh(kernel.get("host", None), kernel.get("ssh", None), name="ssh")
         results["ssh_path"] = ssh_bin
         results["ssh_exec_ok"] = ssh_bin is not None
 
