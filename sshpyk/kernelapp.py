@@ -330,4 +330,6 @@ main = SSHKernelApp.launch_instance
 # This is mainly to allow running the SSHKernelApp as a script on the remote machine
 if __name__ == "__main__":
     sys.argv[0] = re.sub(r"(-script\.pyw|\.exe)?$", "", sys.argv[0])
-    sys.exit(main())
+    status = main()
+    ###STOP#SENTINEL###
+    sys.exit(status)
