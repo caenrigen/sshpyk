@@ -4,6 +4,8 @@ import asyncio
 import hashlib
 import json
 import re
+import os
+import traceback
 import subprocess
 import uuid
 from enum import Enum, unique
@@ -16,7 +18,7 @@ from jupyter_client.connect import KernelConnectionInfo, LocalPortCache
 from jupyter_client.provisioning.provisioner_base import KernelProvisionerBase
 from jupyter_client.session import new_id_bytes
 from jupyter_core.paths import jupyter_runtime_dir, secure_write
-from traitlets import Bool, Integer, Unicode
+from traitlets import Bool, Integer, Unicode, TraitError
 from traitlets import Enum as EnumTrait
 
 from .kernelapp import EXISTING, PERSISTENT, PERSISTENT_FILE, SSH_VERBOSE
@@ -136,6 +138,12 @@ class KernelName(Unicode):
         except:  # noqa: E722
             self.error(obj, value)
 
+class SshConfig(Unicode):
+    def validate(self, obj, value):
+        # value = super().validate(obj, value) # not needed since we check for existance
+        if not os.path.exists(value):
+            raise TraitError(f"SSH config file does not exist: {value!r}")
+        return value
 
 LOG_NAME = "SSHPYK"
 
@@ -165,6 +173,12 @@ class SSHKernelProvisioner(KernelProvisionerBase):
         allow_none=False,
     )
     remote_kernel_name = KernelName(
+        config=True,
+        help="Kernel name on the remote system "
+        "(i.e. first column of `jupyter kernelspec list` on the remote system).",
+        allow_none=False,
+    )
+    ssh_config = SshConfig(
         config=True,
         help="Kernel name on the remote system "
         "(i.e. first column of `jupyter kernelspec list` on the remote system).",
@@ -524,6 +538,7 @@ class SSHKernelProvisioner(KernelProvisionerBase):
                 + rf'cat "{self.rem_conn_fp}" | tr -d "\n" && echo ""',
             ]
             self.ld(f"Fetching remote connection file/kernel PID {cmd = }")
+            self.li(f"Proc: {' '.join(cmd)}")
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
@@ -693,20 +708,19 @@ class SSHKernelProvisioner(KernelProvisionerBase):
         self.ssh = verify_local_ssh(
             self.ssh, log=self.log, name="ssh", lp=self.log_prefix
         )
+        self.ssh_base = [self.ssh, '-F', self.ssh_config]
         if self.ssh_verbose:
             arg = f"-{self.ssh_verbose}"
             self.ld(f"SSH verbose level: {arg}")
-            self.ssh_base = [self.ssh, arg]
-        else:
-            self.ssh_base = [self.ssh]
+            self.ssh_base += [arg]
 
         # BatchMode is expected to be set to 'yes' in the config, must be overridden
         # otherwise it is hard to figure out if some interactive input is required.
         # That can happen when, e.g., a password prompt is required.
-        self.ssh_base_help = [self.ssh, "-o", "BatchMode=no", "-vvv"]
+        self.ssh_base_help = [self.ssh, '-F', self.ssh_config, "-o", "BatchMode=no", "-vvv"]
 
         configs = get_local_ssh_configs(
-            self.ssh, alias=self.ssh_host_alias, log=self.log, lp=self.log_prefix
+            self.ssh_base, alias=self.ssh_host_alias, log=self.log, lp=self.log_prefix
         )
         for config in configs:
             valid = validate_ssh_config(config, log=self.log, lp=self.log_prefix)
@@ -732,6 +746,7 @@ class SSHKernelProvisioner(KernelProvisionerBase):
     async def has_control_socket(self, alias: str, log_error: bool = False):
         cmd = [*self.ssh_base, "-O", "check", alias]
         self.ld(f"Checking local control socket for '{alias}': {cmd = }")
+        self.li(f"Proc: {' '.join(cmd)}")
         process = subprocess.Popen(  # noqa: S603
             cmd,
             stdout=subprocess.PIPE,
@@ -777,7 +792,7 @@ class SSHKernelProvisioner(KernelProvisionerBase):
             ok = False
             for _ in range(3):
                 ok, _ = verify_ssh_connection(
-                    ssh=self.ssh,  # type: ignore
+                    ssh=self.ssh_base,  # type: ignore
                     host_alias=host,
                     log=self.log,
                     lp=self.log_prefix,
@@ -818,8 +833,9 @@ class SSHKernelProvisioner(KernelProvisionerBase):
             f"{remote_script_fp!r}"
         )
         script = f"#!{self.remote_python}\n{KERNELAPP_PY}"
-        self.rem_ka_expected_size = len(script.encode())
-        cmd = [
+        # additional character (i.e. "+ 1" below) accounts for trailing newline which is added
+        self.rem_ka_expected_size = len(script.encode()) + 1
+        cmds = [
             REMOTE_INFO_LINE,
             # If the python executable is not correct `nohub` gives unrelated errors
             # like 'nohup: /.../sshpyk-kernel-v666a490b: No such file or directory'
@@ -828,8 +844,10 @@ class SSHKernelProvisioner(KernelProvisionerBase):
             f'echo "{PY_CHECK}=$?"',
             f'mkdir -p "{self.remote_script_dir}"',
             f'FP_KA="{remote_script_fp}"',
+            f"""cat > "$FP_KA" << 'EOF-APP-SCRIPT'""",
+            f'{script}',
+            f'EOF-APP-SCRIPT',
             f'echo {KA_FP}="$FP_KA"',
-            'cat > "$FP_KA"',
             f'{KA_SIZE}=$(cat "$FP_KA" | wc -c | tr -d " ")',
             f'echo "{KA_SIZE}=${KA_SIZE} (expected {self.rem_ka_expected_size})"',
             'chmod 755 "$FP_KA"',
@@ -837,9 +855,11 @@ class SSHKernelProvisioner(KernelProvisionerBase):
         ]
         # not needed since we do it in pre_launch()
         # await self.check_control_sockets()
-        self.ld(f"Remote command {cmd = }")
-        cmd = [*self.ssh_base, self.ssh_host_alias, "; ".join(cmd)]
+        cmd_input = "\n".join(cmds)
+        self.ld(f"Remote command {cmd_input = }")
+        cmd = [*self.ssh_base, self.ssh_host_alias, 'bash', '-s']
         self.ld(f"Local command {cmd = }")
+        self.li(f"Proc: {' '.join(cmd)}")
         process = subprocess.Popen(  # noqa: S603
             cmd,
             stdout=subprocess.PIPE,
@@ -850,7 +870,7 @@ class SSHKernelProvisioner(KernelProvisionerBase):
             universal_newlines=True,
         )
         self.popen_procs[process.pid] = process
-        process.stdin.write(script)
+        process.stdin.write(cmd_input)
         process.stdin.flush()
         process.stdin.close()
         await self.extract_from_script_write(process=process, cmd=cmd)
@@ -1029,21 +1049,24 @@ class SSHKernelProvisioner(KernelProvisionerBase):
             # Print the PID of the remote SSHKernelApp process
             f'echo "{PID_KA}=$$"',
             # Launch the SSHKernelApp
-            f"exec nohup {cmd}",
+            f"exec nohup {cmd} << 'EOF-key'",
+            km.session.key.decode(),
+            'EOF-key',
         ]
         await self.check_control_sockets()
-        cmd = "; ".join(cmd_parts)
-        self.ld(f"Remote command {cmd = }")
+        self.ld(f"Remote command {cmd_parts = }")
+        cmd_input = "\n".join(cmd_parts)
         cmd = [
             *self.ssh_base,
             # "-t",  # ! We don't need a pseudo-tty to be allocated
             self.ssh_host_alias,
-            cmd,
+            'bash', '-s'
         ]
         self.ld(f"Local command {cmd = }")
 
         # The way the processes are spawned is very important.
         # See launch_kernel() source code in jupyter_client for details.
+        self.li(f"Proc: {' '.join(cmd)}")
         process = subprocess.Popen(  # noqa: S603
             cmd,
             stdout=subprocess.PIPE,
@@ -1068,7 +1091,7 @@ class SSHKernelProvisioner(KernelProvisionerBase):
         # externally-provided connection files.
         # Communicate the session key to the remote process securely using the stdin
         # pipe of the ssh process.
-        process.stdin.write(km.session.key.decode())
+        process.stdin.write(cmd_input)
         process.stdin.flush()
         # Close the input pipe, see launch_kernel in jupyter_client
         # When we close the input pipe, the remote process will receive EOF and the
@@ -1125,6 +1148,7 @@ class SSHKernelProvisioner(KernelProvisionerBase):
             alias,
         ]
         self.ld(f"Periodic kernel tunnels check cmd_str = '{' '.join(cmd)}'")
+        self.li(f"Proc: {' '.join(cmd)}")
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=subprocess.PIPE,
@@ -1181,6 +1205,7 @@ class SSHKernelProvisioner(KernelProvisionerBase):
             self.ssh_host_alias,
         ]
         self.ld(f"Closing tunnels {cmd = }")
+        self.li(f"Proc: {' '.join(cmd)}")
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=subprocess.PIPE,
@@ -1481,6 +1506,7 @@ class SSHKernelProvisioner(KernelProvisionerBase):
         # * Don't log, it is called too often.
         # // self.ld(f"Checking remote processes state {cmd = }")
         try:
+            self.li(f"Proc: {' '.join(cmd)}")
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
@@ -1688,6 +1714,7 @@ class SSHKernelProvisioner(KernelProvisionerBase):
         try:
             await self.check_control_sockets()
             cmd = [*self.ssh_base, self.ssh_host_alias, f"kill -{signum} {pid}"]
+            self.li(f"Proc: {' '.join(cmd)}")
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
