@@ -217,7 +217,7 @@ def validate_ssh_config(config: Dict[str, Union[str, List[str]]]):
     if "identityfile" in keys:
         id_file = config.get("identityfile", None)
         if id_file:
-            fp = Path(id_file).resolve()  # type: ignore
+            fp = Path(id_file).expanduser().resolve()  # type: ignore
             if fp.exists():
                 out["identityfile"] = ("ok", str(fp))
             else:
@@ -261,7 +261,7 @@ def validate_ssh_config(config: Dict[str, Union[str, List[str]]]):
         c_path = config.get("controlpath", None)
         recommended = "~/.ssh/sshpyk_%r@%h_%p"
         if c_path:
-            dp = Path(c_path).resolve().parent  # type: ignore
+            dp = Path(c_path).expanduser().resolve().parent  # type: ignore
             if dp.exists():
                 out["controlpath"] = ("ok", c_path)
             else:
