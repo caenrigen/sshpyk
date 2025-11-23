@@ -16,7 +16,7 @@ from jupyter_client.connect import KernelConnectionInfo, LocalPortCache
 from jupyter_client.provisioning.provisioner_base import KernelProvisionerBase
 from jupyter_client.session import new_id_bytes
 from jupyter_core.paths import jupyter_runtime_dir, secure_write
-from traitlets import Bool, Integer, TraitError, Unicode
+from traitlets import Bool, Integer, Unicode
 from traitlets import Enum as EnumTrait
 
 from .kernelapp import EXISTING, PERSISTENT, PERSISTENT_FILE, SSH_VERBOSE
@@ -63,7 +63,6 @@ PID_KERNEL = "SSHPYK_KERNEL_PID"
 RGX_PID_KERNEL = re.compile(rf"^{PID_KERNEL}=(\d+)")
 # extracted from jupyter_client/kernelspec.py
 RGX_KERNEL_NAME = re.compile(r"^[a-z0-9._-]+$", re.IGNORECASE)
-RGX_SSH_HOST_ALIAS = re.compile(r"^[a-z0-9_-]+$", re.IGNORECASE)
 
 RGX_SSH_LOGS = re.compile(r"^debug\d+: ")
 
@@ -89,21 +88,6 @@ def is_zombie(state: str) -> bool:
     return "z" in state.lower()
 
 
-class SshHost(Unicode):
-    def validate(self, obj, value):
-        value = super().validate(obj, value)
-        try:
-            if not RGX_SSH_HOST_ALIAS.match(value):
-                raise TraitError(
-                    f"Invalid SSH host alias {value!r}. "
-                    f"Must match this pattern {RGX_SSH_HOST_ALIAS.pattern}. "
-                    "Verify that it is defined in your local SSH config file."
-                )
-            return value
-        except Exception as e:
-            self.error(obj, value, e)
-
-
 class UnicodePath(Unicode):
     def validate(self, obj, value):
         value = super().validate(obj, value)
@@ -123,18 +107,6 @@ class MustExistUnicodePath(Unicode):
             msg = "a path to an existing ssh config file"
             self.error(obj, value, ValueError(value, msg))
         return str(p)
-
-
-class UnicodeAbsolutePath(Unicode):
-    def validate(self, obj, value):
-        value = super().validate(obj, value)
-        try:
-            p = Path(value)  # should raise if not a valid path
-            if not p.is_absolute():
-                raise ValueError()
-            return value
-        except Exception:
-            self.error(obj, value, ValueError(value, "an absolute path"))
 
 
 class KernelName(Unicode):
@@ -159,7 +131,7 @@ class SSHKernelProvisioner(KernelProvisionerBase):
     for kernel communication, and manages the lifecycle of the remote kernel.
     """
 
-    ssh_host_alias = SshHost(
+    ssh_host_alias = Unicode(
         config=True,
         help="Remote host alias to connect to. "
         "It must be defined in your local SSH config file.",
@@ -172,7 +144,7 @@ class SSHKernelProvisioner(KernelProvisionerBase):
         allow_none=True,
         default_value=None,
     )
-    remote_python = UnicodeAbsolutePath(
+    remote_python = UnicodePath(
         config=True,
         help="Path to the Python executable on the remote system. "
         "Run `which python` on the remote system to find its path. "
@@ -224,6 +196,13 @@ class SSHKernelProvisioner(KernelProvisionerBase):
     existing = Unicode(**EXISTING)  # type: ignore
     persistent = Bool(**PERSISTENT)  # type: ignore
     persistent_file = Unicode(**PERSISTENT_FILE)  # type: ignore
+    raise_on_ssh_config_error = Bool(
+        default_value=True,
+        config=True,
+        help="If True, raise an error if the SSH config contains errors according "
+        "to our validation rules. Otherwise, log a warning and continue. Set to "
+        "False if you have a more exotic setup and you know what you are doing.",
+    )
 
     restart_requested = False
     log_prefix = ""
@@ -657,11 +636,17 @@ class SSHKernelProvisioner(KernelProvisionerBase):
             host = config["host"]
             for k, (v, msg) in valid.items():
                 if v == "error":
-                    self.le(f"[Local ssh config for {host}] {k}: {msg}")
-                    raise RuntimeError(
-                        f"Invalid config for host alias {host!r}: {k}: {msg} "
-                        "Verify your local ssh config (e.g., ~/.ssh/config)."
-                    )
+                    if self.raise_on_ssh_config_error:
+                        self.le(f"[Local ssh config for {host}] {k}: {msg}")
+                        raise RuntimeError(
+                            f"Invalid config for host alias {host!r}: {k}: {msg} "
+                            "Verify kernel and local ssh config (e.g., ~/.ssh/config). "
+                            "You can set `raise_on_ssh_config_error` to False inside "
+                            "kernel.json if you have a more exotic setup and you know "
+                            "what you are doing."
+                        )
+                    else:
+                        self.lw(f"[Local ssh config for {host}] {k}: {msg}")
                 elif v == "warning":
                     self.lw(f"[Local ssh config for {host}] {k}: {msg}")
                 else:

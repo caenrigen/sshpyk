@@ -8,7 +8,7 @@ from pathlib import Path
 
 from jupyter_client.kernelspec import KernelSpecManager
 
-from .provisioning import RGX_KERNEL_NAME, RGX_SSH_HOST_ALIAS
+from .provisioning import RGX_KERNEL_NAME
 from .utils import (
     LAUNCH_TIMEOUT,
     SHUTDOWN_TIME,
@@ -424,12 +424,6 @@ def add_kernel(args: argparse.Namespace) -> None:
         )
         sys.exit(1)
 
-    # Validate SSH host alias
-    if not RGX_SSH_HOST_ALIAS.match(args.ssh_host_alias):
-        print(f"Error: Invalid SSH host alias '{args.ssh_host_alias}'")
-        print(f"Must match pattern: {RGX_SSH_HOST_ALIAS.pattern!r}")
-        sys.exit(1)
-
     # Validate remote kernel name
     if not RGX_KERNEL_NAME.match(args.remote_kernel_name):
         print(f"Error: Invalid remote kernel name '{args.remote_kernel_name}'")
@@ -550,10 +544,6 @@ def edit_kernel(args: argparse.Namespace) -> None:
     if args.ssh:
         config["ssh"] = args.ssh
     if args.ssh_host_alias:
-        if not RGX_SSH_HOST_ALIAS.match(args.ssh_host_alias):
-            print(f"Error: Invalid SSH host alias '{args.ssh_host_alias}'")
-            print(f"Must match pattern: {RGX_SSH_HOST_ALIAS.pattern}")
-            sys.exit(1)
         config["ssh_host_alias"] = args.ssh_host_alias
 
     if args.remote_python:
